@@ -176,6 +176,14 @@ member p2: enabled
   may_enable: true
 ])
 
+AT_CHECK([ovs-appctl --format=json bond/show bond0 > bond-show.json])
+AT_CHECK([ovstest test-json bond-show.json], [0], [ignore])
+AT_CHECK([grep -q '"reply-format"' bond-show.json], [1])
+AT_CHECK([grep -q '"bond0":{' bond-show.json])
+AT_CHECK([grep -q '"bond_mode":"active-backup"' bond-show.json])
+AT_CHECK([grep -q '"active_member":"p1"' bond-show.json])
+AT_CHECK([grep -q '"may_enable":true' bond-show.json])
+
 OVS_VSWITCHD_STOP
 AT_CLEANUP
 

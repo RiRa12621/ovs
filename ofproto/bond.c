@@ -35,6 +35,7 @@
 #include "ofproto/ofproto-dpif-rid.h"
 #include "ofproto/ofproto-provider.h"
 #include "openvswitch/dynamic-string.h"
+#include "openvswitch/json.h"
 #include "openvswitch/list.h"
 #include "openvswitch/match.h"
 #include "openvswitch/ofp-actions.h"
@@ -1649,32 +1650,198 @@ bond_print_details(struct ds *ds, const struct bond *bond)
     ds_put_cstr(ds, "\n");
 }
 
+static struct json *
+bond_member_to_json(const struct bond *bond, const struct bond_member *member)
+    OVS_REQ_RDLOCK(rwlock)
+{
+    struct json *json_member = json_object_create();
+
+    json_object_put(json_member, "active",
+                    json_boolean_create(member == bond->active_member));
+    json_object_put(json_member, "enabled",
+                    json_boolean_create(member->enabled));
+    if (member->delay_expires != LLONG_MAX) {
+        json_object_put_string(json_member, "delay",
+                               member->enabled ? "downdelay" : "updelay");
+        json_object_put(json_member, "delay_expires_ms",
+                        json_integer_create(member->delay_expires
+                                            - time_msec()));
+    }
+    json_object_put(json_member, "may_enable",
+                    json_boolean_create(member->may_enable));
+
+    if (bond_is_balanced(bond)) {
+        struct json *hashes = json_array_create_empty();
+
+        for (const struct bond_entry *be = bond->hash;
+             be <= &bond->hash[BOND_MASK]; be++) {
+            uint64_t be_tx_k = be->tx_bytes / 1024;
+
+            if (be->member == member && be_tx_k) {
+                struct json *hash = json_object_create();
+
+                json_object_put(hash, "hash",
+                                json_integer_create(be - bond->hash));
+                json_object_put(hash, "load_kb",
+                                json_integer_create(be_tx_k));
+                json_array_add(hashes, hash);
+            }
+        }
+
+        json_object_put(json_member, "hashes", hashes);
+    }
+
+    return json_member;
+}
+
+static struct json *
+bond_to_json(const struct bond *bond)
+    OVS_REQ_RDLOCK(rwlock)
+{
+    const struct bond_member *member;
+    bool use_lb_output_action;
+    bool found_primary = false;
+    bool may_recirc;
+    uint32_t recirc_id;
+    struct json *json_bond = json_object_create();
+    struct json *json_members = json_object_create();
+    struct json *primary = json_object_create();
+
+    HMAP_FOR_EACH (member, hmap_node, &bond->members) {
+        if (member->is_primary) {
+            found_primary = true;
+        }
+        json_object_put(json_members, member->name,
+                        bond_member_to_json(bond, member));
+    }
+
+    may_recirc = bond_may_recirc(bond);
+    recirc_id = bond->recirc_id;
+    use_lb_output_action = bond_use_lb_output_action(bond);
+
+    json_object_put_string(json_bond, "bond_mode",
+                           bond_mode_to_string(bond->balance));
+    json_object_put(json_bond, "may_recirc",
+                    json_boolean_create(may_recirc));
+    json_object_put(json_bond, "recirc_id",
+                    json_integer_create(may_recirc
+                                        ? (long long int) recirc_id : -1));
+    json_object_put(json_bond, "bond_hash_basis",
+                    json_integer_create(bond->basis));
+    json_object_put(json_bond, "lb_output_action",
+                    json_boolean_create(use_lb_output_action));
+    json_object_put(json_bond, "lb_output_action_id",
+                    json_integer_create(use_lb_output_action
+                                        ? (long long int) recirc_id : -1));
+
+    if (bond->balance == BM_SLB) {
+        json_object_put(json_bond, "all_members_active",
+                        json_boolean_create(bond->all_members_active));
+    }
+
+    json_object_put(json_bond, "updelay_ms",
+                    json_integer_create(bond->updelay));
+    json_object_put(json_bond, "downdelay_ms",
+                    json_integer_create(bond->downdelay));
+
+    if (bond_is_balanced(bond)) {
+        json_object_put(json_bond, "next_rebalance_ms",
+                        json_integer_create(bond->next_rebalance
+                                            - time_msec()));
+    }
+
+    json_object_put_string(json_bond, "lacp_status",
+                           lacp_status_description(bond->lacp_status));
+    json_object_put(json_bond, "lacp_fallback_ab",
+                    json_boolean_create(bond->lacp_fallback_ab));
+
+    json_object_put(primary, "configured",
+                    json_boolean_create(bond->primary != NULL));
+    json_object_put(primary, "member_exists",
+                    json_boolean_create(found_primary));
+    if (bond->primary) {
+        json_object_put_string(primary, "name", bond->primary);
+    } else {
+        json_object_put(primary, "name", json_null_create());
+    }
+    json_object_put(json_bond, "active_backup_primary", primary);
+
+    if (bond->active_member) {
+        json_object_put_string(json_bond, "active_member",
+                               bond->active_member->name);
+    } else {
+        json_object_put(json_bond, "active_member", json_null_create());
+    }
+
+    json_object_put_format(json_bond, "active_member_mac", ETH_ADDR_FMT,
+                           ETH_ADDR_ARGS(bond->active_member_mac));
+
+    member = bond_find_member_by_mac(bond, bond->active_member_mac);
+    if (member) {
+        json_object_put_string(json_bond, "active_member_mac_member",
+                               member->name);
+    } else {
+        json_object_put(json_bond, "active_member_mac_member",
+                        json_null_create());
+    }
+
+    json_object_put(json_bond, "members", json_members);
+
+    return json_bond;
+}
+
 static void
 bond_unixctl_show(struct unixctl_conn *conn,
                   int argc, const char *argv[],
                   void *aux OVS_UNUSED)
 {
-    struct ds ds = DS_EMPTY_INITIALIZER;
+    bool json = unixctl_command_get_output_format(conn)
+                == UNIXCTL_OUTPUT_FMT_JSON;
 
     ovs_rwlock_rdlock(&rwlock);
-    if (argc > 1) {
-        const struct bond *bond = bond_find(argv[1]);
+    if (json) {
+        struct json *json_bonds = json_object_create();
 
-        if (!bond) {
-            unixctl_command_reply_error(conn, "no such bond");
-            goto out;
+        if (argc > 1) {
+            const struct bond *bond = bond_find(argv[1]);
+
+            if (!bond) {
+                json_destroy(json_bonds);
+                unixctl_command_reply_error(conn, "no such bond");
+                goto out;
+            }
+            json_object_put(json_bonds, bond->name, bond_to_json(bond));
+        } else {
+            const struct bond *bond;
+
+            HMAP_FOR_EACH (bond, hmap_node, all_bonds) {
+                json_object_put(json_bonds, bond->name, bond_to_json(bond));
+            }
         }
-        bond_print_details(&ds, bond);
+
+        unixctl_command_reply_json(conn, json_bonds);
     } else {
-        const struct bond *bond;
+        struct ds ds = DS_EMPTY_INITIALIZER;
 
-        HMAP_FOR_EACH (bond, hmap_node, all_bonds) {
+        if (argc > 1) {
+            const struct bond *bond = bond_find(argv[1]);
+
+            if (!bond) {
+                unixctl_command_reply_error(conn, "no such bond");
+                goto out;
+            }
             bond_print_details(&ds, bond);
-        }
-    }
+        } else {
+            const struct bond *bond;
 
-    unixctl_command_reply(conn, ds_cstr(&ds));
-    ds_destroy(&ds);
+            HMAP_FOR_EACH (bond, hmap_node, all_bonds) {
+                bond_print_details(&ds, bond);
+            }
+        }
+
+        unixctl_command_reply(conn, ds_cstr(&ds));
+        ds_destroy(&ds);
+    }
 
 out:
     ovs_rwlock_unlock(&rwlock);
